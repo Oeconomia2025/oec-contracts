@@ -1,0 +1,17 @@
+// Post-deploy calls (owner), using your DDB on Sepolia:
+// Token: 0x02675d29817Dd82E4268A58cd11Ba3d3868bd9B3
+
+// 1) Add pools
+addPool(0x02675d29817Dd82E4268A58cd11Ba3d3868bd9B3, 0x02675d29817Dd82E4268A58cd11Ba3d3868bd9B3, 1500, 0);        // A: Flex, 15%
+addPool(0x02675d29817Dd82E4268A58cd11Ba3d3868bd9B3, 0x02675d29817Dd82E4268A58cd11Ba3d3868bd9B3, 2500, 2592000);   // B: 30d, 25%
+addPool(0x02675d29817Dd82E4268A58cd11Ba3d3868bd9B3, 0x02675d29817Dd82E4268A58cd11Ba3d3868bd9B3, 4000, 5184000);   // C: 60d, 40%
+addPool(0x02675d29817Dd82E4268A58cd11Ba3d3868bd9B3, 0x02675d29817Dd82E4268A58cd11Ba3d3868bd9B3, 8000, 7776000);   // D: 90d, 80%
+
+// 2) Penalties (optional; A=0%, B=10%, C=15%, D=20%)
+setPenaltyRecipient(0xYourTreasuryOrDAOAddress);
+setEarlyPenaltyBps(0, 0);
+setEarlyPenaltyBps(1, 1000);
+setEarlyPenaltyBps(2, 1500);
+setEarlyPenaltyBps(3, 2000);
+
+// 3) Fund rewards: transfer 20,000,000 DDB to the staking contract address.

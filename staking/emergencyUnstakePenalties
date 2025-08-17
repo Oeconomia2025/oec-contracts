@@ -1,0 +1,11 @@
+// optional: send penalties to your treasury (defaults to deployer if you skip)
+setPenaltyRecipient(0xYourTreasuryOrDAOAddress);
+
+// A: 0%
+setEarlyPenaltyBps(0, 0);
+// B: 10%
+setEarlyPenaltyBps(1, 1000);
+// C: 15%
+setEarlyPenaltyBps(2, 1500);
+// D: 20%
+setEarlyPenaltyBps(3, 2000);
