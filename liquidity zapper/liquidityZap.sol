@@ -214,7 +214,7 @@ contract LiquidityZapETH {
         // Swap ETH -> token
         uint256 tokenBefore = IERC20(token).balanceOf(self);
         if (ethToSwap > 0) {
-            address;
+        address[] memory path = new address[](2);
             path[0] = WETH;
             path[1] = token;
 
