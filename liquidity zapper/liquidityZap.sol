@@ -2,20 +2,12 @@
 pragma solidity ^0.8.23;
 
 /**
- * @title LiquidityZapETH (hardened)
- * @notice Deposit ETH only: 10% to treasury, 90% is zapped into OEC/ETH LP on Uniswap V2.
- * Security improvements vs. original:
- *  - Fixed swap path syntax
- *  - ReentrancyGuard on entry-points; receive() restricted to router/WETH
- *  - Explicit slippage & deadline parameters
- *  - Checks-Effects-Interactions order; robust return validations
- *  - No owner-controlled LP recipient (LP goes to the caller)
- *  - Two-step, delayed admin changes (timelocked) for treasury
- *  - Emergency pause; events + custom errors; named constants
+ * @title LiquidityZapETH v1.2 (Uniswap V2)
+ * @notice Deposit ETH: 10% -> treasury, ~90% zapped into OEC/ETH LP. LP goes to caller.
+ * Security: nonReentrant entrypoint, router/WETH-only receive(), slippage/deadline params, timelocked treasury updates, pause, custom errors.
  */
 interface IERC20 {
     function balanceOf(address) external view returns (uint256);
-    function transfer(address to, uint256 amount) external returns (bool);
     function approve(address spender, uint256 amount) external returns (bool);
 }
 
@@ -23,18 +15,10 @@ interface IUniswapV2Router02 {
     function WETH() external view returns (address);
     function factory() external view returns (address);
     function swapExactETHForTokensSupportingFeeOnTransferTokens(
-        uint amountOutMin,
-        address[] calldata path,
-        address to,
-        uint deadline
+        uint amountOutMin, address[] calldata path, address to, uint deadline
     ) external payable;
     function addLiquidityETH(
-        address token,
-        uint amountTokenDesired,
-        uint amountTokenMin,
-        uint amountETHMin,
-        address to,
-        uint deadline
+        address token, uint amountTokenDesired, uint amountTokenMin, uint amountETHMin, address to, uint deadline
     ) external payable returns (uint amountToken, uint amountETH, uint liquidity);
 }
 
@@ -45,7 +29,7 @@ interface IUniswapV2Factory {
 interface IUniswapV2Pair {
     function token0() external view returns (address);
     function token1() external view returns (address);
-    function getReserves() external view returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast);
+    function getReserves() external view returns (uint112 r0, uint112 r1, uint32);
 }
 
 contract LiquidityZapETH {
@@ -53,39 +37,35 @@ contract LiquidityZapETH {
                                 ERRORS
     //////////////////////////////////////////////////////////////*/
     error ZeroDeposit();
-    error Paused();
+    error InsufficientAmount();
     error DeadlineExpired();
+    error Paused();
     error NoPool();
-    error BadRouterRefund();
     error InsufficientOutput();
     error LPNotMinted();
     error Unauthorized();
     error TooHighSlippage();
+    error BadRouterRefund();
     error TimelockPending();
     error NothingPending();
+    error InvalidTreasury();
 
     /*//////////////////////////////////////////////////////////////
-                              IMMUTABLES
+                               IMMUTABLES
     //////////////////////////////////////////////////////////////*/
     IUniswapV2Router02 public immutable router;
     IUniswapV2Factory public immutable factory;
-    address public immutable token;     // OEC token
-    address public immutable WETH;      // from router
+    address public immutable token;
+    address public immutable WETH;
 
     /*//////////////////////////////////////////////////////////////
-                               OWNERSHIP
+                                OWNER
     //////////////////////////////////////////////////////////////*/
     address public owner;
     address public pendingOwner;
+    modifier onlyOwner() { if (msg.sender != owner) revert Unauthorized(); _; }
 
-    modifier onlyOwner() {
-        if (msg.sender != owner) revert Unauthorized();
-        _;
-    }
-
-    /*//////////////////////////////////////////////////////////////
-                          SIMPLE REENTRANCY GUARD
-    //////////////////////////////////////////////////////////////*/
+    /* simple nonReentrant */
     uint256 private _locked = 1;
     modifier nonReentrant() {
         if (_locked != 1) revert Unauthorized();
@@ -95,35 +75,30 @@ contract LiquidityZapETH {
     }
 
     /*//////////////////////////////////////////////////////////////
-                                STATE
+                                 STATE
     //////////////////////////////////////////////////////////////*/
-    // Basis points constants
     uint256 public constant BPS = 10_000;
-    uint256 public constant TREASURY_BPS = 1_000; // 10%
+    uint256 public constant TREASURY_BPS = 1_000;         // 10%
     uint256 public constant ZAP_BPS = BPS - TREASURY_BPS; // 90%
 
-    // Uniswap V2 constants used in optimal one-sided liquidity formula (0.30% fee)
-    uint256 private constant FEE_NUM = 997;   // 1000 - 3
+    // Uniswap V2 (0.30% fee) constants for optimal one-sided add
+    uint256 private constant FEE_NUM = 997;
     uint256 private constant FEE_DEN = 1000;
-    uint256 private constant A_NUM = 3988000; // 2 * FEE_NUM * 1000
-    uint256 private constant B_NUM = 3988009; // (1000 + FEE_NUM)^2
-    uint256 private constant C1 = 1997;       // 2*FEE_NUM+3
-    uint256 private constant C2 = 1994;       // 2*(1000-3)
+    uint256 private constant A_NUM = 3988000;
+    uint256 private constant B_NUM = 3988009;
+    uint256 private constant C1 = 1997;
+    uint256 private constant C2 = 1994;
 
-    // Timelock configuration
+    // Minimal ETH needed for a meaningful zap (prevents 1-wei corner cases)
+    uint256 public constant MIN_ETH_FOR_ZAP = 2; // wei; keep tiny to avoid surprising users
+
+    // Timelock for treasury updates
     uint64 public constant MIN_DELAY = 12 hours;
-    struct PendingAddress {
-        address value;
-        uint64 applyAfter;
-    }
+    struct PendingAddress { address value; uint64 applyAfter; }
     PendingAddress public pendingTreasury;
 
-    // Treasury that receives the 10% + leftovers
     address payable public treasury;
-
-    // Global pause
     bool public paused;
-    event PausedSet(bool isPaused);
 
     /*//////////////////////////////////////////////////////////////
                                  EVENTS
@@ -131,6 +106,7 @@ contract LiquidityZapETH {
     event OwnerUpdate(address indexed oldOwner, address indexed newOwner);
     event TreasuryQueued(address indexed newTreasury, uint64 applyAfter);
     event TreasuryApplied(address indexed newTreasury);
+    event PausedSet(bool isPaused);
     event Zapped(
         address indexed user,
         uint256 ethDeposited,
@@ -142,6 +118,9 @@ contract LiquidityZapETH {
         uint256 treasuryPaid
     );
 
+    /*//////////////////////////////////////////////////////////////
+                               CONSTRUCTOR
+    //////////////////////////////////////////////////////////////*/
     constructor(address _router, address _token, address payable _treasury) {
         owner = msg.sender;
         router = IUniswapV2Router02(_router);
@@ -149,33 +128,33 @@ contract LiquidityZapETH {
         token = _token;
         WETH = IUniswapV2Router02(_router).WETH();
         treasury = _treasury;
+
+        // Approve router once (reset to 0 first for safety on non-standard ERC20s)
+        IERC20(_token).approve(_router, 0);
+        IERC20(_token).approve(_router, type(uint256).max);
     }
 
     /*//////////////////////////////////////////////////////////////
-                            OWNERSHIP + TIMELOCK
+                           OWNERSHIP + TIMELOCK
     //////////////////////////////////////////////////////////////*/
-    function renounceOwnership() external onlyOwner {
-        emit OwnerUpdate(owner, address(0));
-        owner = address(0);
-        pendingOwner = address(0);
-    }
-
-    function transferOwnership(address newOwner) external onlyOwner {
-        pendingOwner = newOwner;
-    }
-
+    function transferOwnership(address newOwner) external onlyOwner { pendingOwner = newOwner; }
     function acceptOwnership() external {
         if (msg.sender != pendingOwner) revert Unauthorized();
         emit OwnerUpdate(owner, pendingOwner);
         owner = pendingOwner;
         pendingOwner = address(0);
     }
-
-    function queueTreasury(address payable newTreasury) external onlyOwner {
-        pendingTreasury = PendingAddress({value: newTreasury, applyAfter: uint64(block.timestamp) + MIN_DELAY});
-        emit TreasuryQueued(newTreasury, pendingTreasury.applyAfter);
+    function renounceOwnership() external onlyOwner {
+        emit OwnerUpdate(owner, address(0));
+        owner = address(0);
+        pendingOwner = address(0);
     }
 
+    function queueTreasury(address payable newTreasury) external onlyOwner {
+        if (newTreasury == treasury || newTreasury == address(0)) revert InvalidTreasury();
+        pendingTreasury = PendingAddress({ value: newTreasury, applyAfter: uint64(block.timestamp) + MIN_DELAY });
+        emit TreasuryQueued(newTreasury, pendingTreasury.applyAfter);
+    }
     function applyTreasury() external {
         PendingAddress memory p = pendingTreasury;
         if (p.value == address(0)) revert NothingPending();
@@ -184,21 +163,16 @@ contract LiquidityZapETH {
         delete pendingTreasury;
         emit TreasuryApplied(treasury);
     }
-
-    /*//////////////////////////////////////////////////////////////
-                           EMERGENCY PAUSE
-    //////////////////////////////////////////////////////////////*/
     function setPaused(bool _paused) external onlyOwner { paused = _paused; emit PausedSet(_paused); }
 
     /*//////////////////////////////////////////////////////////////
                               USER ENTRYPOINT
     //////////////////////////////////////////////////////////////*/
     /**
-     * @notice Zaps ETH into token/ETH LP on Uniswap V2 (LP sent to caller). 10% of msg.value goes to treasury.
-     * @param swapSlippageBps Max slippage in BPS for the swap leg (against constant-product quote)
-     * @param addLpSlippageBps Min % of our token/ETH we demand router to use when minting LP (each leg)
+     * @param swapSlippageBps Max swap slippage in BPS (cap 5%)
+     * @param addLpSlippageBps Max LP-leg slippage in BPS (cap 5%)
      * @param deadline Unix timestamp; must be >= now
-     * @param minLPMinted Minimum LP tokens the user is willing to receive (extra safety)
+     * @param minLPMinted Minimum acceptable LP tokens (extra safety)
      */
     function zapETH(
         uint256 swapSlippageBps,
@@ -209,60 +183,61 @@ contract LiquidityZapETH {
         if (paused) revert Paused();
         if (msg.value == 0) revert ZeroDeposit();
         if (deadline < block.timestamp) revert DeadlineExpired();
-        if (swapSlippageBps > 500 || addLpSlippageBps > 500) revert TooHighSlippage(); // cap at 5%
+        if (swapSlippageBps > 500 || addLpSlippageBps > 500) revert TooHighSlippage();
+
+        address self = address(this);
+        address theRouter = address(router);
 
         uint256 totalETH = msg.value;
         uint256 treasuryDue = (totalETH * TREASURY_BPS) / BPS;
         uint256 ethForZap = totalETH - treasuryDue;
+        if (ethForZap < MIN_ETH_FOR_ZAP) revert InsufficientAmount();
 
-        // Find pair + reserves
+        // Pair + reserves
         address pair = factory.getPair(token, WETH);
         if (pair == address(0)) revert NoPool();
         (uint112 r0, uint112 r1, ) = IUniswapV2Pair(pair).getReserves();
-        (uint256 rETH, uint256 rTOKEN) = IUniswapV2Pair(pair).token0() == WETH ? (uint256(r0), uint256(r1)) : (uint256(r1), uint256(r0));
+        (uint256 rETH, uint256 rTOKEN) = IUniswapV2Pair(pair).token0() == WETH
+            ? (uint256(r0), uint256(r1))
+            : (uint256(r1), uint256(r0));
 
-        // Compute optimal ETH to swap to tokens
+        // Optimal swap amount (fallback to 50/50 if too small)
         uint256 ethToSwap = _optimalSwapAmt(ethForZap, rETH);
+        if (ethToSwap == 0) {
+            ethToSwap = ethForZap / 2; // safe due to MIN_ETH_FOR_ZAP
+        }
 
-        // Compute minOut for swap using Uniswap V2 formula
+        // Compute swap minOut against current reserves
         uint256 expectedOut = _getAmountOut(ethToSwap, rETH, rTOKEN);
         uint256 minOut = expectedOut * (BPS - swapSlippageBps) / BPS;
 
-        // Effects: record token balance before (for fee-on-transfer tokens)
-        uint256 tokenBefore = IERC20(token).balanceOf(address(this));
-
-        // Interactions: do the swap (ETH -> token)
-        {
+        // Swap ETH -> token
+        uint256 tokenBefore = IERC20(token).balanceOf(self);
+        if (ethToSwap > 0) {
             address;
             path[0] = WETH;
             path[1] = token;
+
             router.swapExactETHForTokensSupportingFeeOnTransferTokens{value: ethToSwap}(
                 minOut,
                 path,
-                address(this),
+                self,
                 deadline
             );
         }
+        uint256 tokensBought = IERC20(token).balanceOf(self) - tokenBefore;
 
-        // Effects: measure tokens actually received
-        uint256 tokensBought = IERC20(token).balanceOf(address(this)) - tokenBefore;
-
-        // Prepare to add liquidity with remaining ETH + all tokens we just got
+        // Add liquidity with remaining ETH + bought tokens
         uint256 ethForLP = ethForZap - ethToSwap;
-        // Token/ETH minimums for LP (protect against extreme price move)
         uint256 tokenMin = tokensBought * (BPS - addLpSlippageBps) / BPS;
         uint256 ethMin   = ethForLP   * (BPS - addLpSlippageBps) / BPS;
 
-        // Approve router once for token spend (infinite)
-        IERC20(token).approve(address(router), type(uint256).max);
-
-        // Interactions: add liquidity
         (uint256 amountToken, uint256 amountETH, uint256 liquidity) = router.addLiquidityETH{value: ethForLP}(
             token,
             tokensBought,
             tokenMin,
             ethMin,
-            msg.sender,   // LP tokens go straight to the caller (no centralization risk)
+            msg.sender,
             deadline
         );
 
@@ -270,9 +245,9 @@ contract LiquidityZapETH {
         if (amountToken < tokenMin || amountETH < ethMin) revert InsufficientOutput();
         if (liquidity < minLPMinted) revert InsufficientOutput();
 
-        // ANY leftover ETH in this contract (refunds from router + the 10% fee) goes to treasury
-        uint256 leftover = address(this).balance;
-        uint256 payout = leftover + treasuryDue;
+        // Send 10% + any leftover ETH (router refunds) to treasury
+        uint256 leftover = self.balance;
+        uint256 payout = treasuryDue + leftover;
         if (payout > 0) {
             (bool ok, ) = treasury.call{value: payout}("");
             if (!ok) revert BadRouterRefund();
@@ -289,24 +264,25 @@ contract LiquidityZapETH {
         address pair = factory.getPair(token, WETH);
         if (pair == address(0)) revert NoPool();
         (uint112 r0, uint112 r1, ) = IUniswapV2Pair(pair).getReserves();
-        (uint256 rETH, uint256 rTOKEN) = IUniswapV2Pair(pair).token0() == WETH ? (uint256(r0), uint256(r1)) : (uint256(r1), uint256(r0));
+        (uint256 rETH, uint256 rTOKEN) = IUniswapV2Pair(pair).token0() == WETH
+            ? (uint256(r0), uint256(r1))
+            : (uint256(r1), uint256(r0));
         uint256 ethForZap = ethIn * ZAP_BPS / BPS;
+        if (ethForZap < MIN_ETH_FOR_ZAP) return (0, 0);
         swapEth = _optimalSwapAmt(ethForZap, rETH);
+        if (swapEth == 0) swapEth = ethForZap / 2;
         expectedTokenOut = _getAmountOut(swapEth, rETH, rTOKEN);
     }
 
     /*//////////////////////////////////////////////////////////////
-                             INTERNAL MATH
+                            INTERNAL MATH
     //////////////////////////////////////////////////////////////*/
     function _getAmountOut(uint256 amountIn, uint256 rIn, uint256 rOut) internal pure returns (uint256) {
-        // Standard Uniswap V2 formula with 0.30% fee
         uint256 amountInWithFee = amountIn * FEE_NUM;
         return (amountInWithFee * rOut) / (rIn * FEE_DEN + amountInWithFee);
     }
 
-    /// @dev Optimal one-sided add amount to swap when adding liquidity with only ETH leg
     function _optimalSwapAmt(uint256 amountIn, uint256 rIn) internal pure returns (uint256) {
-        // Derivation from Alpha Finance's formula with fee 0.30%
         // s = (sqrt(r*(A*amountIn + B*r)) - C1*r) / C2
         uint256 a = A_NUM * amountIn + B_NUM * rIn;
         uint256 b = _sqrt(rIn * a);
@@ -319,16 +295,12 @@ contract LiquidityZapETH {
         if (x == 0) return 0;
         uint256 z = (x + 1) / 2;
         y = x;
-        while (z < y) {
-            y = z;
-            z = (x / z + z) / 2;
-        }
+        while (z < y) { y = z; z = (x / z + z) / 2; }
     }
 
     /*//////////////////////////////////////////////////////////////
-                               RECEIVE/FALLBACK
+                           RECEIVE: ROUTER or WETH
     //////////////////////////////////////////////////////////////*/
-    // Only accept ETH from router/WETH (refunds). Prevents accidental sends & limits reentrancy surface.
     receive() external payable {
         if (msg.sender != address(router) && msg.sender != WETH) revert BadRouterRefund();
     }
