@@ -2,7 +2,7 @@
 pragma solidity ^0.8.27;
 
 /**
- * @title Multi-Pool Staking (Fixed APR + Early Withdraw Penalties)
+ * @title Multi-Pool Staking (Fixed APR + Early Withdraw Penalties) — FOT-friendly
  * @notice Each pool pays a fixed APR (basis points) per staked token, independent of TVL.
  *         Pools enforce a lock period; users may:
  *           - withdraw() after lock (no penalty, rewards paid)
@@ -12,13 +12,17 @@ pragma solidity ^0.8.27;
  *         APR accrual per token per second = (aprBps/10000)/SECONDS_PER_YEAR * 1e18.
  *         Contract must hold enough rewardsToken or getReward() will revert.
  *
- *         This implementation:
- *           - Uses SafeERC20 (handles non-standard returns)
- *           - Is Pausable (stake/withdraw/reward paths pauseable; emergencyWithdraw always open)
- *           - Caps APR and lock period
- *           - Blocks recovery of any pool's staking/reward tokens
- *           - Enforces 18-decimal tokens (both stake & reward)
- *           - Rejects fee-on-transfer staking tokens (exact in/out checks)
+ *         Security hardening:
+ *           - SafeERC20 for robust token interactions
+ *           - Pausable (stake/withdraw/getReward can be paused; emergencyWithdraw stays open)
+ *           - Caps on APR and lock period
+ *           - Cannot recover any pool's staking/reward tokens
+ *           - Enforces 18-decimal tokens (both stake & reward) — simplifies math
+ *
+ *         Fee-on-transfer (FOT) support:
+ *           - On stake: user credited by net tokens actually received by the contract
+ *           - On withdraw/early/emergency: contract transfers the requested amount; recipient
+ *             may receive less due to token fees (expected behavior for FOT tokens)
  */
 
 import "https://raw.githubusercontent.com/OpenZeppelin/openzeppelin-contracts/v5.0.2/contracts/token/ERC20/IERC20.sol";
@@ -43,11 +47,11 @@ contract MultiPoolStakingAPR is ReentrancyGuard, Ownable, Pausable {
         IERC20 rewardsToken;                 // token paid as rewards
         uint256 aprBps;                      // APR in basis points (e.g., 1000 = 10%)
         uint256 lockPeriod;                  // seconds user must wait since last deposit before normal withdraw
-        uint256 totalSupply;                 // total staked
+        uint256 totalSupply;                 // total staked (credited amount, net of FOT on deposit)
         uint256 lastUpdateTime;              // last time rewardPerTokenStored updated
         uint256 rewardPerTokenStored;        // per-token accumulator (scaled by 1e18)
 
-        mapping(address => uint256) balances;                // user => staked amount
+        mapping(address => uint256) balances;                // user => staked amount (credited)
         mapping(address => uint256) userRewardPerTokenPaid;  // user => snapshot of RPT
         mapping(address => uint256) rewards;                 // user => accrued but unclaimed
         mapping(address => uint256) depositTimestamps;       // user => last deposit ts (for lock)
@@ -63,7 +67,7 @@ contract MultiPoolStakingAPR is ReentrancyGuard, Ownable, Pausable {
     // -------- Events --------
     event PoolCreated(uint256 indexed poolId, address stakingToken, address rewardsToken, uint256 aprBps, uint256 lockPeriod);
     event PoolUpdated(uint256 indexed poolId, uint256 aprBps, uint256 lockPeriod);
-    event Staked(uint256 indexed poolId, address indexed user, uint256 amount);
+    event Staked(uint256 indexed poolId, address indexed user, uint256 creditedAmount);
     event Withdrawn(uint256 indexed poolId, address indexed user, uint256 amount);
     event RewardPaid(uint256 indexed poolId, address indexed user, uint256 reward);
     event EmergencyWithdraw(uint256 indexed poolId, address indexed user, uint256 amount);
@@ -195,24 +199,24 @@ contract MultiPoolStakingAPR is ReentrancyGuard, Ownable, Pausable {
         }
     }
 
-    // -------- User actions --------
+    // -------- User actions (FOT-friendly) --------
     function stake(uint256 poolId, uint256 amount) external nonReentrant whenNotPaused poolExists(poolId) {
         require(amount > 0, "Cannot stake 0");
         Pool storage p = pools[poolId];
 
         _updateReward(poolId, msg.sender);
 
-        // Strictly reject fee-on-transfer staking tokens (exact in)
+        // Credit by actual tokens received (supports fee-on-transfer)
         uint256 beforeBal = p.stakingToken.balanceOf(address(this));
         p.stakingToken.safeTransferFrom(msg.sender, address(this), amount);
         uint256 received = p.stakingToken.balanceOf(address(this)) - beforeBal;
-        require(received == amount, "Fee-on-transfer staking token not supported");
+        require(received > 0, "No tokens received");
 
-        p.totalSupply += amount;
-        p.balances[msg.sender] += amount;
-        p.depositTimestamps[msg.sender] = block.timestamp; // reset lock window on each deposit (documented UX)
+        p.totalSupply += received;
+        p.balances[msg.sender] += received;
+        p.depositTimestamps[msg.sender] = block.timestamp; // resets lock for entire position
 
-        emit Staked(poolId, msg.sender, amount);
+        emit Staked(poolId, msg.sender, received);
     }
 
     function withdraw(uint256 poolId, uint256 amount) public nonReentrant whenNotPaused poolExists(poolId) {
@@ -227,11 +231,8 @@ contract MultiPoolStakingAPR is ReentrancyGuard, Ownable, Pausable {
         p.totalSupply -= amount;
         p.balances[msg.sender] -= amount;
 
-        // Strictly reject fee-on-transfer behavior on outbound (exact out)
-        uint256 userBefore = p.stakingToken.balanceOf(msg.sender);
+        // Recipient may receive less due to token's transfer fee
         p.stakingToken.safeTransfer(msg.sender, amount);
-        uint256 userAfter = p.stakingToken.balanceOf(msg.sender);
-        require(userAfter - userBefore == amount, "Stake token takes fee on transfer");
 
         emit Withdrawn(poolId, msg.sender, amount);
     }
@@ -243,32 +244,22 @@ contract MultiPoolStakingAPR is ReentrancyGuard, Ownable, Pausable {
         require(p.balances[msg.sender] >= amount, "Exceeds balance");
         require(block.timestamp < p.depositTimestamps[msg.sender] + p.lockPeriod, "Lock over; use withdraw()");
 
-        _updateReward(poolId, msg.sender); // keep accounting in sync
+        _updateReward(poolId, msg.sender); // sync accounting
 
-        // compute penalty on principal
         uint256 bps = earlyPenaltyBps[poolId];
         uint256 penalty = (amount * bps) / 10000;
         uint256 payout = amount - penalty;
 
-        // update state BEFORE transfers
+        // Update state before external calls
         p.totalSupply -= amount;
         p.balances[msg.sender] -= amount;
 
-        // forfeit any accrued rewards on early exit (after update)
+        // Forfeit accrued rewards on early exit (after update)
         p.rewards[msg.sender] = 0;
 
-        // transfers with strict exact-out checks
-        uint256 userBefore = p.stakingToken.balanceOf(msg.sender);
-        p.stakingToken.safeTransfer(msg.sender, payout);
-        uint256 userAfter = p.stakingToken.balanceOf(msg.sender);
-        require(userAfter - userBefore == payout, "Stake token takes fee on transfer");
-
-        if (penalty > 0) {
-            uint256 penBefore = p.stakingToken.balanceOf(penaltyRecipient);
-            p.stakingToken.safeTransfer(penaltyRecipient, penalty);
-            uint256 penAfter = p.stakingToken.balanceOf(penaltyRecipient);
-            require(penAfter - penBefore == penalty, "Stake token takes fee on transfer");
-        }
+        // Transfers: both subject to token fees, which is expected behavior
+        if (payout > 0) p.stakingToken.safeTransfer(msg.sender, payout);
+        if (penalty > 0) p.stakingToken.safeTransfer(penaltyRecipient, penalty);
 
         emit EarlyWithdrawWithPenalty(poolId, msg.sender, amount, penalty);
     }
@@ -280,6 +271,7 @@ contract MultiPoolStakingAPR is ReentrancyGuard, Ownable, Pausable {
         uint256 reward = p.rewards[msg.sender];
         if (reward > 0) {
             p.rewards[msg.sender] = 0;
+            // If rewardsToken is FOT, user may receive net-of-fee. We pay the full booked reward amount.
             p.rewardsToken.safeTransfer(msg.sender, reward);
             emit RewardPaid(poolId, msg.sender, reward);
         }
@@ -291,8 +283,8 @@ contract MultiPoolStakingAPR is ReentrancyGuard, Ownable, Pausable {
     }
 
     /**
-     * @notice Emergency exit for stakers: returns staked tokens immediately, forfeits rewards.
-     *         Ignores lock period. True break-glass path. Always available even if paused.
+     * @notice Emergency exit: returns staked tokens immediately, forfeits rewards. Ignores lock.
+     *         Always available even if paused. Recipient may receive net-of-fee for FOT tokens.
      */
     function emergencyWithdraw(uint256 poolId) external nonReentrant poolExists(poolId) {
         Pool storage p = pools[poolId];
@@ -304,11 +296,7 @@ contract MultiPoolStakingAPR is ReentrancyGuard, Ownable, Pausable {
         p.balances[msg.sender] = 0;
         p.rewards[msg.sender] = 0;
 
-        // strict exact-out check (reject fee-on-transfer tokens)
-        uint256 userBefore = p.stakingToken.balanceOf(msg.sender);
         p.stakingToken.safeTransfer(msg.sender, staked);
-        uint256 userAfter = p.stakingToken.balanceOf(msg.sender);
-        require(userAfter - userBefore == staked, "Stake token takes fee on transfer");
 
         emit EmergencyWithdraw(poolId, msg.sender, staked);
     }
