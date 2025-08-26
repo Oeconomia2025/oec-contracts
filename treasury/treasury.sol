@@ -157,15 +157,28 @@ contract OeconomiaTreasury {
     uint256 public constant MAX_DELAY = 30 days;
 
     event DelayUpdated(uint256 oldDelay, uint256 newDelay);
+
+    // Enriched with timestamp (M3)
     event WithdrawalQueued(
         bytes32 indexed id,
         address indexed proposer,
         address indexed token,
         address to,
         uint256 amount,
-        uint256 executeAfter
+        uint256 executeAfter,
+        uint256 queuedAt
     );
-    event WithdrawalExecuted(bytes32 indexed id, address indexed executor);
+
+    // Enriched with full context + timestamp (M3)
+    event WithdrawalExecuted(
+        bytes32 indexed id,
+        address indexed executor,
+        address indexed token,
+        address to,
+        uint256 amount,
+        uint256 executedAt
+    );
+
     event WithdrawalCanceled(bytes32 indexed id, address indexed by);
 
     function setDelay(uint256 newDelay) external onlyOwner {
@@ -201,7 +214,10 @@ contract OeconomiaTreasury {
         require(to != address(0), "BAD_TO");
         require(amount > 0, "ZERO_AMOUNT");
 
+        // M2: explicit guard (checked math in 0.8.x already protects, this adds clarity)
+        require(nonce != type(uint256).max, "NONCE_OVERFLOW");
         uint256 _n = ++nonce;
+
         id = computeId(token, to, amount, _n);
         require(withdrawals[id].executeAfter == 0, "ALREADY_EXISTS");
 
@@ -216,7 +232,7 @@ contract OeconomiaTreasury {
             canceled: false
         });
 
-        emit WithdrawalQueued(id, msg.sender, token, to, amount, executeAfter);
+        emit WithdrawalQueued(id, msg.sender, token, to, amount, executeAfter, block.timestamp);
     }
 
     /// @notice Execute a matured, not-canceled withdrawal.
@@ -229,20 +245,26 @@ contract OeconomiaTreasury {
         Withdrawal storage w = withdrawals[id];
         require(w.executeAfter != 0, "NOT_FOUND");
         require(!w.executed, "ALREADY_EXECUTED");
-        require(!w.canceled, "CANCELED");
+        require(!w.canceled, "ALREADY_CANCELED");
         require(block.timestamp >= w.executeAfter, "TOO_EARLY");
+
+        // M1: balance checks prior to transfer for clearer failures
+        if (w.token == address(0)) {
+            require(address(this).balance >= w.amount, "INSUFFICIENT_ETH");
+        } else {
+            require(IERC20(w.token).balanceOf(address(this)) >= w.amount, "INSUFFICIENT_TOKENS");
+        }
 
         w.executed = true;
 
         if (w.token == address(0)) {
-            // native ETH
             (bool ok, ) = w.to.call{value: w.amount}("");
             require(ok, "ETH_SEND_FAIL");
         } else {
             IERC20(w.token).safeTransfer(w.to, w.amount);
         }
 
-        emit WithdrawalExecuted(id, msg.sender);
+        emit WithdrawalExecuted(id, msg.sender, w.token, w.to, w.amount, block.timestamp);
     }
 
     /// @notice Cancel a queued withdrawal (owner-only).
@@ -262,17 +284,14 @@ contract OeconomiaTreasury {
     event DepositETH(address indexed from, uint256 amount, string memo);
     event DepositERC20(address indexed token, address indexed from, uint256 amount, string memo);
 
-    /// @notice Accept native ETH.
     receive() external payable {
         emit DepositETH(msg.sender, msg.value, "");
     }
 
-    /// @notice Accept native ETH with a memo.
     function depositETH(string calldata memo) external payable {
         emit DepositETH(msg.sender, msg.value, memo);
     }
 
-    /// @notice Pull ERC20 into treasury (requires prior approve).
     function depositERC20(address token, uint256 amount, string calldata memo) external whenNotPaused {
         require(token != address(0), "BAD_TOKEN");
         require(amount > 0, "ZERO_AMOUNT");
@@ -280,12 +299,10 @@ contract OeconomiaTreasury {
         emit DepositERC20(token, msg.sender, amount, memo);
     }
 
-    /// @notice Current native ETH balance.
     function ethBalance() external view returns (uint256) {
         return address(this).balance;
     }
 
-    /// @notice Current ERC20 balance for a token.
     function tokenBalance(address token) external view returns (uint256) {
         return IERC20(token).balanceOf(address(this));
     }
@@ -302,17 +319,51 @@ contract OeconomiaTreasury {
         owner = msg.sender;
         delay = initialDelay;
 
-        // Owner is implicitly both roles; also seed extra roles if provided
+        // Owner is implicitly both roles
         proposers[msg.sender] = true;
         executors[msg.sender] = true;
 
-        for (uint256 i = 0; i < initialProposers.length; i++) {
-            proposers[initialProposers[i]] = true;
-            emit ProposerUpdated(initialProposers[i], true);
+        // L3: validate arrays for zero-address and duplicates (constructor-only, O(n^2) acceptable)
+        uint256 pLen = initialProposers.length;
+        for (uint256 i = 0; i < pLen; ) {
+            address p = initialProposers[i];
+            require(p != address(0), "ZERO_PROPOSER");
+            for (uint256 j = i + 1; j < pLen; ) {
+                require(initialProposers[j] != p, "DUPLICATE_PROPOSER");
+                unchecked { ++j; }
+            }
+            unchecked { ++i; }
         }
-        for (uint256 j = 0; j < initialExecutors.length; j++) {
-            executors[initialExecutors[j]] = true;
-            emit ExecutorUpdated(initialExecutors[j], true);
+
+        uint256 eLen = initialExecutors.length;
+        for (uint256 i2 = 0; i2 < eLen; ) {
+            address e = initialExecutors[i2];
+            require(e != address(0), "ZERO_EXECUTOR");
+            for (uint256 j2 = i2 + 1; j2 < eLen; ) {
+                require(initialExecutors[j2] != e, "DUPLICATE_EXECUTOR");
+                unchecked { ++j2; }
+            }
+            unchecked { ++i2; }
+        }
+
+        // Now set roles (cache lengths; use unchecked increments)
+        for (uint256 i3 = 0; i3 < pLen; ) {
+            address addr = initialProposers[i3];
+            // if the owner is repeated in the array, skip (already set)
+            if (addr != owner) {
+                proposers[addr] = true;
+                emit ProposerUpdated(addr, true);
+            }
+            unchecked { ++i3; }
+        }
+
+        for (uint256 j3 = 0; j3 < eLen; ) {
+            address addr2 = initialExecutors[j3];
+            if (addr2 != owner) {
+                executors[addr2] = true;
+                emit ExecutorUpdated(addr2, true);
+            }
+            unchecked { ++j3; }
         }
 
         emit OwnershipTransferred(address(0), msg.sender);
